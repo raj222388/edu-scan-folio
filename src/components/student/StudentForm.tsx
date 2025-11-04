@@ -14,25 +14,12 @@ interface StudentFormProps {
   onCancel: () => void;
 }
 
-// Helper function to convert Data URL (from QR) to a Blob for upload
-function dataURLtoBlob(dataurl: string) {
-  const arr = dataurl.split(',');
-  const mime = (arr[0].match(/:(.*?);/) || [])[1];
-  const bstr = atob(arr[1]);
-  let n = bstr.length;
-  const u8arr = new Uint8Array(n);
-  while (n--) {
-    u8arr[n] = bstr.charCodeAt(n);
-  }
-  return new Blob([u8arr], { type: mime });
-}
-
 export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps) {
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const { toast } = useToast();
 
-  // FIX: Changed to <any> to flexibly hold the entire student object
+  // Use an empty object as the default state
   const [formData, setFormData] = useState<any>({});
 
   const [images, setImages] = useState({
@@ -64,7 +51,7 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
       return;
     }
 
-    // FIX: Set the entire data object to preserve image URLs
+    // Set the entire data object to preserve image URLs
     setFormData({
       ...data,
       // Convert JSON marks back to a string for the input field
@@ -73,25 +60,23 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
   };
 
   const uploadImage = async (file: File, path: string): Promise<string | null> => {
+    // Make sure 'student-images' is your bucket name
+    const bucketName = 'student-images';
     const fileExt = file.name.split('.').pop();
-    // Use a more unique file name
     const fileName = `${path}/${Date.now()}-${Math.random()}.${fileExt}`;
 
     const { error: uploadError } = await supabase.storage
-      .from('student-images') // Make sure 'student-images' is your bucket name
+      .from(bucketName)
       .upload(fileName, file);
 
     if (uploadError) {
       throw uploadError;
     }
 
-    const { data } = supabase.storage.from('student-images').getPublicUrl(fileName);
+    const { data } = supabase.storage.from(bucketName).getPublicUrl(fileName);
     return data.publicUrl;
   };
 
-  /**
-   * ✅ THIS IS THE CORRECTED HANDLE SUBMIT FUNCTION
-   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -100,12 +85,10 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
       // --- Part 1: Handle Image Uploads ---
       setUploading(true);
       
-      // FIX: Start with existing image URLs from formData to prevent deletion
       let studentImageUrl = formData.student_image_url || null;
       let fatherImageUrl = formData.father_image_url || null;
       let motherImageUrl = formData.mother_image_url || null;
 
-      // Upload new images if they exist
       if (images.student) {
         studentImageUrl = await uploadImage(images.student, 'students');
       }
@@ -127,24 +110,19 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
         previous_marks: formData.previous_marks ? JSON.parse(formData.previous_marks) : null,
       };
 
-      // Remove properties that aren't columns or should not be copied
-      delete studentPayload.qr_code; // Will be regenerated
-      delete studentPayload.id; // Not needed in payload
-      delete studentPayload.created_at; // Not needed in payload
+      delete studentPayload.qr_code;
+      delete studentPayload.id;
+      delete studentPayload.created_at;
 
       // --- Part 3: Handle Create vs. Update (The QR Fix) ---
 
       if (studentId) {
         // --- A. UPDATE (EDIT) LOGIC ---
         
-        // 1. Build the correct URL using the *existing* studentId
         const studentPageUrl = `${window.location.origin}/students/${studentId}`;
-        // 2. Generate QR from that URL
         const qrDataUrl = await QRCode.toDataURL(studentPageUrl);
-        // 3. Add the new QR code (as a Data URL) to the payload
-        (studentPayload as any).qr_code = qrDataUrl;
+        (studentPayload as any).qr_code = qrDataUrl; // Add the new QR code
 
-        // 4. Update in Supabase
         const { error } = await supabase
           .from('students')
           .update(studentPayload)
@@ -154,24 +132,26 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
       } else {
         // --- B. CREATE (NEW) LOGIC ---
         
-        // 1. Insert student *without* QR code to get the new ID
+        // ✅ FIX: Add a temporary placeholder to satisfy the "NOT NULL" error
+        (studentPayload as any).qr_code = 'generating...'; 
+
+        // 1. Insert student WITH the placeholder QR code
         const { data: newStudent, error: insertError } = await supabase
           .from('students')
           .insert([studentPayload])
-          .select() // Need to get the new ID back
+          .select()
           .single();
         
         if (insertError) throw insertError;
 
         const newStudentId = newStudent.id;
 
-        // 2. Now, build the URL with the *new* ID
+        // 2. Now, build the REAL URL with the new ID
         const studentPageUrl = `${window.location.origin}/students/${newStudentId}`;
-        // 3. Generate QR from that URL
+        // 3. Generate the REAL QR from that URL
         const qrDataUrl = await QRCode.toDataURL(studentPageUrl);
         
-        // 4. Update the new record with *only* the QR code
-        // We save the base64 string, which your <img> tag in StudentDetail can render
+        // 4. Update the record, overwriting the placeholder with the REAL QR code
         const { error: updateError } = await supabase
           .from('students')
           .update({ qr_code: qrDataUrl })
@@ -185,7 +165,7 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
         title: 'Success',
         description: `Student ${studentId ? 'updated' : 'added'} successfully`,
       });
-      onSuccess(); // Close the modal or navigate away
+      onSuccess();
 
     } catch (error: any) {
       console.error('Error saving student:', error);
