@@ -14,19 +14,36 @@ interface StudentFormProps {
   onCancel: () => void;
 }
 
+/**
+ * NEW HELPER FUNCTION
+ * Converts a base64 Data URL (which QRCode.toDataURL generates)
+ * into a Blob object that we can upload to Supabase Storage.
+ */
+function dataURLtoBlob(dataurl: string) {
+  const arr = dataurl.split(',');
+  const mime = (arr[0].match(/:(.*?);/) || [])[1];
+  const bstr = atob(arr[1]);
+  let n = bstr.length;
+  const u8arr = new Uint8Array(n);
+  while (n--) {
+    u8arr[n] = bstr.charCodeAt(n);
+  }
+  return new Blob([u8arr], { type: mime });
+}
+
 export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps) {
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const { toast } = useToast();
-
-  // Use an empty object as the default state
   const [formData, setFormData] = useState<any>({});
-
   const [images, setImages] = useState({
     student: null as File | null,
     father: null as File | null,
     mother: null as File | null,
   });
+
+  // Make sure this is your correct bucket name!
+  const STORAGE_BUCKET = 'student-images';
 
   useEffect(() => {
     if (studentId) {
@@ -41,42 +58,33 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
       .select('*')
       .eq('id', studentId)
       .single();
-
     if (error) {
-      toast({
-        title: 'Error',
-        description: 'Failed to load student data',
-        variant: 'destructive',
-      });
+      toast({ title: 'Error', description: 'Failed to load student data', variant: 'destructive' });
       return;
     }
-
-    // Set the entire data object to preserve image URLs
     setFormData({
       ...data,
-      // Convert JSON marks back to a string for the input field
       previous_marks: data.previous_marks ? JSON.stringify(data.previous_marks) : '',
     });
   };
 
-  const uploadImage = async (file: File, path: string): Promise<string | null> => {
-    // Make sure 'student-images' is your bucket name
-    const bucketName = 'student-images';
-    const fileExt = file.name.split('.').pop();
+  const uploadImage = async (file: File | Blob, path: string): Promise<string | null> => {
+    const fileExt = file instanceof File ? file.name.split('.').pop() : 'png';
     const fileName = `${path}/${Date.now()}-${Math.random()}.${fileExt}`;
 
     const { error: uploadError } = await supabase.storage
-      .from(bucketName)
+      .from(STORAGE_BUCKET)
       .upload(fileName, file);
+    if (uploadError) throw uploadError;
 
-    if (uploadError) {
-      throw uploadError;
-    }
-
-    const { data } = supabase.storage.from(bucketName).getPublicUrl(fileName);
+    const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(fileName);
     return data.publicUrl;
   };
 
+  /**
+   * ✅ CORRECTED HANDLESUBMIT
+   * This version now uploads the QR code to storage.
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -84,21 +92,14 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
     try {
       // --- Part 1: Handle Image Uploads ---
       setUploading(true);
-      
       let studentImageUrl = formData.student_image_url || null;
       let fatherImageUrl = formData.father_image_url || null;
       let motherImageUrl = formData.mother_image_url || null;
 
-      if (images.student) {
-        studentImageUrl = await uploadImage(images.student, 'students');
-      }
-      if (images.father) {
-        fatherImageUrl = await uploadImage(images.father, 'parents');
-      }
-      if (images.mother) {
-        motherImageUrl = await uploadImage(images.mother, 'parents');
-      }
-
+      if (images.student) studentImageUrl = await uploadImage(images.student, 'students');
+      if (images.father) fatherImageUrl = await uploadImage(images.father, 'parents');
+      if (images.mother) motherImageUrl = await uploadImage(images.mother, 'parents');
+      
       setUploading(false);
 
       // --- Part 2: Prepare Student Data Payload ---
@@ -109,58 +110,53 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
         mother_image_url: motherImageUrl,
         previous_marks: formData.previous_marks ? JSON.parse(formData.previous_marks) : null,
       };
-
       delete studentPayload.qr_code;
       delete studentPayload.id;
       delete studentPayload.created_at;
 
-      // --- Part 3: Handle Create vs. Update (The QR Fix) ---
+      // --- Part 3: Handle Create vs. Update ---
+      let finalStudentId = studentId;
 
       if (studentId) {
         // --- A. UPDATE (EDIT) LOGIC ---
-        
-        const studentPageUrl = `${window.location.origin}/students/${studentId}`;
-        const qrDataUrl = await QRCode.toDataURL(studentPageUrl);
-        (studentPayload as any).qr_code = qrDataUrl; // Add the new QR code
-
         const { error } = await supabase
           .from('students')
           .update(studentPayload)
           .eq('id', studentId);
         if (error) throw error;
-
       } else {
         // --- B. CREATE (NEW) LOGIC ---
-        
-        // ✅ FIX: Add a temporary placeholder to satisfy the "NOT NULL" error
-        (studentPayload as any).qr_code = 'generating...'; 
-
-        // 1. Insert student WITH the placeholder QR code
+        // Insert student (qr_code will be null, which is fine)
         const { data: newStudent, error: insertError } = await supabase
           .from('students')
           .insert([studentPayload])
           .select()
           .single();
-        
         if (insertError) throw insertError;
-
-        const newStudentId = newStudent.id;
-
-        // 2. Now, build the REAL URL with the new ID
-        const studentPageUrl = `${window.location.origin}/students/${newStudentId}`;
-        // 3. Generate the REAL QR from that URL
-        const qrDataUrl = await QRCode.toDataURL(studentPageUrl);
-        
-        // 4. Update the record, overwriting the placeholder with the REAL QR code
-        const { error: updateError } = await supabase
-          .from('students')
-          .update({ qr_code: qrDataUrl })
-          .eq('id', newStudentId);
-
-        if (updateError) throw updateError;
+        finalStudentId = newStudent.id; // Get the new ID
       }
 
-      // --- Part 4: Finish ---
+      // --- Part 4: ✅ GENERATE AND UPLOAD QR CODE ---
+      // This now runs for BOTH create and update
+      
+      // 1. Build the correct, live URL
+      const studentPageUrl = `${window.location.origin}/students/${finalStudentId}`;
+      // 2. Generate the QR as a base64 string
+      const qrDataUrl = await QRCode.toDataURL(studentPageUrl);
+      // 3. Convert it to a Blob
+      const qrBlob = dataURLtoBlob(qrDataUrl);
+      // 4. Upload the QR Blob to storage
+      const qrPublicUrl = await uploadImage(qrBlob, `qr_codes/${finalStudentId}`);
+
+      // 5. Save the *public URL* to the student record
+      const { error: qrUpdateError } = await supabase
+        .from('students')
+        .update({ qr_code: qrPublicUrl })
+        .eq('id', finalStudentId);
+
+      if (qrUpdateError) throw qrUpdateError;
+
+      // --- Part 5: Finish ---
       toast({
         title: 'Success',
         description: `Student ${studentId ? 'updated' : 'added'} successfully`,
@@ -180,6 +176,7 @@ export function StudentForm({ studentId, onSuccess, onCancel }: StudentFormProps
     }
   };
 
+  // --- JSX (No changes below this line) ---
   return (
     <Card>
       <CardHeader>
